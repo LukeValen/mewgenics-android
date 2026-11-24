@@ -1,0 +1,239 @@
+diff --git a/tools/lift/generate64.py b/tools/lift/generate64.py
+index ee47c89..d70fe49 100644
+--- a/tools/lift/generate64.py
++++ b/tools/lift/generate64.py
+@@ -230,9 +230,18 @@ def plausible_code(read_va, va):
+         from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+         _CODE_MD = Cs(CS_ARCH_X86, CS_MODE_64)
+     try:
+-        code = read_va(va, 16)
++        code = read_va(va, 48)
+     except Exception:
+         return False
++    # Mewgenics: 16 bytes cut a leaf function whose first two loads are 7 bytes each
++    # (0x1408E3C20); and an entry right after int3/ret padding is a function start.
++    try:
++        prev = read_va(va - 1, 1)[0]
++    except Exception:
++        prev = None
++    first = next(iter(_CODE_MD.disasm(code, va)), None)
++    if prev in (0xCC, 0xC3) and first is not None and first.mnemonic != 'int3' and code[:2] != b'\x00\x00':
++        return True
+     n = 0
+     for ins in _CODE_MD.disasm(code, va):
+         if ins.mnemonic in ('int3', 'in', 'out', 'hlt', 'iretd', 'iretq',
+@@ -241,6 +250,16 @@ def plausible_code(read_va, va):
+         n += 1
+         if n >= 3:
+             return True
++        # Mewgenics: atexit destructor thunks are "lea rcx, [obj]; jmp dtor" followed by
++        # int3 padding (0x140E3CF00), and empty ones are a lone "ret 0" (0x140E3E618),
++        # right after the previous thunk's jmp. A one- or two-instruction sequence ending
++        # in an unconditional jmp/ret right before padding or a 16-byte boundary is a
++        # complete function.
++        if n <= 2 and ins.mnemonic in ('jmp', 'ret'):
++            end = ins.address + ins.size
++            nxt = code[end - va] if end - va < len(code) else None
++            if nxt == 0xCC or end % 16 == 0:
++                return True
+     return False
+ 
+ 
+diff --git a/tools/lift/lift64_cpu.py b/tools/lift/lift64_cpu.py
+index 7bbe9ab..1913bb8 100644
+--- a/tools/lift/lift64_cpu.py
++++ b/tools/lift/lift64_cpu.py
+@@ -183,7 +183,7 @@ SSE64_EXTRA = (
+     frozenset(PACKED_ARITH) | frozenset(PACKED_MINMAX)
+     | frozenset({'shufps', 'shufpd', 'unpcklps', 'unpckhps',
+                  'unpcklpd', 'unpckhpd', 'movhlps', 'movlhps',
+-                 'movmskps', 'movmskpd', 'sqrtps', 'rcpps',
++                 'movmskps', 'movmskpd', 'sqrtps', 'sqrtpd', 'pmuludq', 'cvtpd2dq', 'cvttpd2dq', 'rcpps',
+                  'rsqrtps', 'rsqrtss', 'rcpss', 'cvtdq2pd',
+                  'movlps', 'movhps', 'movlpd', 'movhpd',
+                  'cvtsi2ssl', 'cvtsi2sdl', 'cvtsi2ssq', 'cvtsi2sdq',
+@@ -821,6 +821,16 @@ class Lifter:
+             rd_ = self._sd if wide else self._ss
+             return ['%s = %s(%s);' % (rd_(insn, d), 'sqrt' if wide else 'sqrtf',
+                                       rd_(insn, s))]
++        if m == 'sqrtpd':
++            n = self._xi(d)
++            body = ' '.join('c->xmm[%d].f64[%d] = sqrt(_s.f64[%d]);' % (n, i, i)
++                            for i in range(2))
++            return ['{ XMM _s = %s; %s }' % (self._xm(insn, s), body)]
++        if m == 'pmuludq':
++            n = self._xi(d)
++            body = ' '.join('c->xmm[%d].u64[%d] = (uint64_t)_d.u32[%d] * (uint64_t)_s.u32[%d];'
++                            % (n, i, 2*i, 2*i) for i in range(2))
++            return ['{ XMM _d = c->xmm[%d], _s = %s; %s }' % (n, self._xm(insn, s), body)]
+         if m == 'sqrtps':
+             n = self._xi(d)
+             body = ' '.join('c->xmm[%d].f32[%d] = sqrtf(_s.f32[%d]);' % (n, i, i)
+@@ -961,6 +971,13 @@ class Lifter:
+                                 % (n, i, i))
+             return ['{ XMM _s = %s; %s }' % (self._xm(insn, s), ' '.join(body))]
+ 
++        if m in ('cvtpd2dq', 'cvttpd2dq'):
++            n = self._xi(d)
++            r = 'nearbyint(_s.f64[%d])' if m == 'cvtpd2dq' else '_s.f64[%d]'
++            return ['{ XMM _s = %s; c->xmm[%d].i32[0] = sse_cvtt_i32(%s); c->xmm[%d].i32[1] = sse_cvtt_i32(%s);'
++                    ' c->xmm[%d].i32[2] = 0; c->xmm[%d].i32[3] = 0; }'
++                    % (self._xm(insn, s), n, r % 0, n, r % 1, n, n)]
++
+         if m == 'cvtdq2pd':
+             # Two ints from the LOW 64 bits, two doubles out.
+             n = self._xi(d)
+@@ -1006,8 +1023,36 @@ class Lifter:
+         ea = insn.address
+         nxt = insn.address + insn.size
+ 
+-        if m.startswith('lock '):
++        locked = m.startswith('lock ')
++        if locked:
+             m = m[5:]
++        # A LOCKed read-modify-write is atomic on x86 and other threads rely on
++        # it (reference counts, spin locks). Lifted as a plain load and store it
++        # races - and clang may even keep the value in a register across a spin
++        # loop. So: real host atomics, flags from the old value.
++        if locked and ops and ops[0].type == X86_OP_MEM and ops[0].size in (1, 2, 4, 8) and \
++                m in ('add', 'sub', 'and', 'or', 'xor', 'inc', 'dec'):
++            d = ops[0]
++            sz = d.size
++            w = 8 * sz
++            ptr = '(uint%d_t *)(uintptr_t)(%s)' % (w, self.addr_expr(insn, d))
++            if m in ('inc', 'dec'):
++                fn = 'flags_incs' if m == 'inc' else 'flags_decs'
++                op = '__atomic_fetch_add' if m == 'inc' else '__atomic_fetch_sub'
++                return ['{ uint%d_t _o = %s(%s, 1, __ATOMIC_SEQ_CST); %s(c, _o, %d); }' % (w, op, ptr, fn, sz)]
++            v = self.src_ext(insn, ops[1], sz)
++            op = {'add': '__atomic_fetch_add', 'sub': '__atomic_fetch_sub', 'and': '__atomic_fetch_and',
++                  'or': '__atomic_fetch_or', 'xor': '__atomic_fetch_xor'}[m]
++            if m == 'add':
++                fl = 'flags_add(c, _o, _v, %d);' % sz
++            elif m == 'sub':
++                fl = 'flags_sub(c, _o, _v, %d);' % sz
++            else:
++                fl = 'flags_logicz(c, _o %s _v, %d);' % ({'and': '&', 'or': '|', 'xor': '^'}[m], sz)
++            return ['{ uint%d_t _v = (uint%d_t)(%s); uint%d_t _o = %s(%s, _v, __ATOMIC_SEQ_CST); %s }'
++                    % (w, w, v, w, op, ptr, fl)]
++        if m == 'pause':
++            return ['w64_cpu_relax();']
+ 
+         # An F3/F2 prefix is only a REP on a string instruction. On anything
+         # else it is a hint, and the one that matters is `repz ret` (F3 C3) -
+@@ -1025,6 +1070,14 @@ class Lifter:
+         def sz0():
+             return ops[0].size
+ 
++        # x87 control bookkeeping (Mewgenics: the CRT's setjmp/longjmp save and
++        # restore the control word next to MXCSR). No x87 arithmetic runs, so like
++        # stmxcsr/ldmxcsr above: report the x64 default control word, ignore loads.
++        if m in ('fnstcw', 'fstcw') and ops and ops[0].type == X86_OP_MEM:
++            return [self.wr(insn, ops[0], '0x027F')]
++        if m in ('fldcw', 'fnclex', 'fclex', 'fninit', 'finit', 'fwait', 'wait'):
++            return ['/* %s: x87 control state not modelled */' % m]
++
+         # x87 and MMX are not modelled - see the module docstring. Caught here
+         # so they cannot fall through into a same-named integer handler.
+         if m[0] == 'f' and m not in ('fs',):
+@@ -1141,6 +1194,11 @@ class Lifter:
+             fn = {'shl': 'op_shl', 'sal': 'op_shl', 'shr': 'op_shr', 'sar': 'op_sar'}[m]
+             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
+                                    % (fn, self._read_dst(insn, d), cnt, d.size))]
++        if m in ('rcl', 'rcr'):
++            d = ops[0]
++            cnt = self.src(insn, ops[1]) if len(ops) > 1 else '1'
++            return [self.dst_write(insn, d, 'op_%s(c, %s, %s, %d)'
++                                   % (m, self._read_dst(insn, d), cnt, d.size))]
+         if m in ('rol', 'ror'):
+             d = ops[0]
+             cnt = self.src(insn, ops[1]) if len(ops) > 1 else '1'
+@@ -1164,6 +1222,10 @@ class Lifter:
+             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
+                                    % (fn, self._read_dst(insn, d),
+                                       self.src(insn, s), d.size))]
++        if m in ('tzcnt', 'lzcnt'):
++            d, s = two()
++            return ['{ uint64_t _s = %s; uint64_t _r = op_%s(_s, %d); %s c->cf = (_s == 0); c->zf = (_r == 0); }'
++                    % (self.src(insn, s), m, s.size, self.dst_write(insn, d, '_r'))]
+         if m in ('bsf', 'bsr'):
+             d, s = two()
+             fn = 'op_' + m
+@@ -1197,12 +1259,29 @@ class Lifter:
+ 
+         if m == 'xchg':
+             d, s = two()
++            # with a memory operand xchg is implicitly locked
++            if d.type == X86_OP_MEM or s.type == X86_OP_MEM:
++                mem, reg = (d, s) if d.type == X86_OP_MEM else (s, d)
++                w = 8 * mem.size
++                return ['{ uint%d_t _o = __atomic_exchange_n((uint%d_t *)(uintptr_t)(%s), (uint%d_t)(%s), __ATOMIC_SEQ_CST); %s }'
++                        % (w, w, self.addr_expr(insn, mem), w, self.src(insn, reg), self.dst_write(insn, reg, '_o'))]
+             return ['{ uint64_t _t = %s; %s %s }'
+                     % (self._read_dst(insn, d),
+                        self.dst_write(insn, d, self.src(insn, s)),
+                        self.dst_write(insn, s, '_t'))]
+ 
+         # ---- interlocked ----
++        if m == 'cmpxchg' and sz0() in (1, 2) and ops[0].type == X86_OP_MEM:
++            d, s = two()
++            w = 8 * sz0()
++            acc = 'R8L(c->rax)' if w == 8 else 'R16(c->rax)'
++            setacc = 'SET8L(c->rax, _exp)' if w == 8 else 'SET16(c->rax, _exp)'
++            return ['{ uint%d_t _exp = (uint%d_t)%s, _old = _exp;' % (w, w, acc),
++                    '  int _ok = __atomic_compare_exchange_n((uint%d_t *)(uintptr_t)(%s), &_exp, (uint%d_t)(%s), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);'
++                    % (w, self.addr_expr(insn, d), w, self.src(insn, s)),
++                    '  flags_sub(c, _old, _exp, %d); if (!_ok) %s; }' % (sz0(), setacc)]
++        if m in ('sfence', 'lfence', 'mfence'):
++            return ['__atomic_thread_fence(__ATOMIC_SEQ_CST);']
+         if m in ('xadd', 'cmpxchg') and sz0() in (4, 8):
+             d, s = two()
+             sz = sz0()
+@@ -1247,6 +1326,12 @@ class Lifter:
+             return ['SET8H(c->rax, (uint8_t)((c->sf<<7)|(c->zf<<6)|(c->af<<4)'
+                     '|(c->pf<<2)|2|c->cf));']
+ 
++        if m == 'bswap':
++            d = ops[0]
++            if d.size == 8:
++                return [self.dst_write(insn, d, '__builtin_bswap64(%s)' % self._read_dst(insn, d))]
++            return [self.dst_write(insn, d, '(uint64_t)__builtin_bswap32((uint32_t)(%s))' % self._read_dst(insn, d))]
++
+         # ---- multiply / divide ----
+         if m == 'mul':
+             s = ops[0]
+@@ -1314,14 +1399,18 @@ class Lifter:
+                 # after setting rdx to the sign extension of rax (cqo) or to
+                 # zero, so the 64/64 form below is what actually runs. A genuine
+                 # 128-bit numerator would need __int128 and is caught, not guessed.
++                # 64/64 fast path when rdx is the sign/zero extension of rax,
++                # __int128 otherwise (both host compilers have it).
+                 if sg:
+-                    return ['{ int64_t _n=(int64_t)c->rax, _d=(int64_t)(%s);' % v,
+-                            '  if ((c->rdx != 0) && (c->rdx != ~(uint64_t)0))'
+-                            ' RECOMP_TODO(0x%X, "idiv: true 128-bit numerator");' % ea,
+-                            '  c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }']
+-                return ['{ uint64_t _n=c->rax, _d=(uint64_t)(%s);' % v,
+-                        '  if (c->rdx != 0) RECOMP_TODO(0x%X, "div: true 128-bit numerator");' % ea,
+-                        '  c->rax=_n/_d; c->rdx=_n%_d; }']
++                    return ['{ int64_t _d=(int64_t)(%s);' % v,
++                            '  if (c->rdx == (uint64_t)((int64_t)c->rax >> 63)) {'
++                            ' int64_t _n=(int64_t)c->rax; c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }',
++                            '  else { __int128 _n=(__int128)(((unsigned __int128)c->rdx<<64)|c->rax);'
++                            ' c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); } }']
++                return ['{ uint64_t _d=(uint64_t)(%s);' % v,
++                        '  if (c->rdx == 0) { uint64_t _n=c->rax; c->rax=_n/_d; c->rdx=_n%_d; }',
++                        '  else { unsigned __int128 _n=((unsigned __int128)c->rdx<<64)|c->rax;'
++                        ' c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); } }']
+             if sz == 4:
+                 if sg:
+                     return ['{ int64_t _n=(int64_t)(((uint64_t)R32(c->rdx)<<32)|R32(c->rax));'
+@@ -1435,7 +1524,7 @@ class Lifter:
+                     % (extra, t.imm)]
+ 
+         # ---- no-ops and flag fiddling ----
+-        if m in ('nop', 'int3', 'hint_nop', 'pause', 'wait', 'fwait', 'endbr64'):
++        if m in ('nop', 'int3', 'hint_nop', 'wait', 'fwait', 'endbr64'):
+             return ['/* %s */' % m]
+         if m == 'cld':
+             return ['/* cld */']

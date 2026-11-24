@@ -1,0 +1,8 @@
+# GL entry points implemented by hand in runtime/src/gl_bridge.c
+glDebugMessageCallback
+glDebugMessageCallbackARB
+glDebugMessageCallbackKHR
+glDebugMessageCallbackAMD
+glGetString
+glGetStringi
+glShaderSource

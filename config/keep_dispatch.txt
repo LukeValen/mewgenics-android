@@ -1,0 +1,2 @@
+0x140B8FF30  # tinfl_decompress -> runtime/src/hle_libs.c
+0x140A24760  # DXT5 image compressor -> runtime/src/hle_libs.c
