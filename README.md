@@ -1,14 +1,35 @@
-# Mewgenics for Android — static recompilation
+# Mewgenics – Android port (build it yourself)
 
 An Android (arm64) port of the PC version of **Mewgenics**, made by statically recompiling the
 Steam build's `Mewgenics.exe` (x86-64, Win64): the machine code is translated to C ahead of time
 and compiled natively with the Android NDK. It runs on its own small Win64 runtime with SDL3 and
 OpenGL ES — no emulator, no Wine, no Box64.
 
-> **This repository contains no game code and no game data.** You need your own copy of
-> Mewgenics (Steam). The build translates *your* `Mewgenics.exe`; the resulting APK contains code
-> derived from it and is for your personal use only — do not redistribute it. Mewgenics is © Glaiel
-> Games / Edmund McMillen and Tyler Glaiel. This project is not affiliated with or endorsed by them.
+**There is no prebuilt APK here and nothing from the game.** You build the APK yourself from
+**your own** Steam copy: the build translates your `Mewgenics.exe` on your machine. This repository
+only holds tools, the runtime and per-build lift settings (no game code). The app reads the game
+data (`resources.gpak`) from your copy on the device. The APK you build contains code recompiled
+from your EXE, so it is for you, not for sharing. Mewgenics is © Glaiel Games / Edmund McMillen and
+Tyler Glaiel; this project is not affiliated with or endorsed by them.
+
+*Deutsche Version: [README.de.md](README.de.md)*
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/battle-fold8.jpg" alt="Battle with move preview on a Galaxy Z Fold8, 120 fps"><br><sub>Battle with move preview on a Galaxy Z Fold8 (German UI), 120 fps</sub></td>
+    <td width="50%"><img src="docs/images/battle-alley.jpg" alt="Battle in The Alley"><br><sub>Battle in The Alley (Galaxy Tab S8 Ultra)</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/house.jpg" alt="The house: breeding, End Day, adventure box"><br><sub>The house: breeding, End Day, the adventure box</sub></td>
+    <td width="50%"><img src="docs/images/map-alley.jpg" alt="Adventure map"><br><sub>Adventure map</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/collars.jpg" alt="Equipping class collars by dragging"><br><sub>Class collars, equipped by dragging with a finger</sub></td>
+    <td width="50%"><img src="docs/images/main-menu.jpg" alt="Main menu"><br><sub>Main menu</sub></td>
+  </tr>
+</table>
 
 ## Status
 
